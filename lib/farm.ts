@@ -1,64 +1,79 @@
 /**
- * Token Launch Radar — Deterministic Net-to-the-Dollar 7-Step Farm Plan Engine
+ * Token Launch Radar (v2) — Net $/Hour Costed 8-Step Farm Engine, T-Bill Benchmark & 2D Sensitivity
  * Runtime: Node.js 22.18+ (erasable TypeScript syntax, standard library only, 0 network)
  *
- * Selects the lowest-gas chain from candidate.chains (tie-break ASCII), computes
- * category-specific 7-step farming actions with exact dollar costs (gas + protocol fee
- * + opportunity cost), break-even capital, strict penny-level reconciliation, and
- * gate-compliant concise farm_steps strings.
+ * Default scenario: $10,000 deposit, 7.0% airdrop share, 12-week (84-day) horizon, 4.0% APR T-bill benchmark.
+ * Evaluates expected_drop_usd = implied_value_usd * drop_share * (deposit / (tvl_usd + deposit)),
+ * subtracts exact 8-step costs (optimal low-gas chain gas + category fees + 4% T-bill benchmark),
+ * reconciles step costs to the exact cent, produces Net $/Hour verdicts (FARM / MARGINAL / SKIP),
+ * and generates a 4×4 Drop Share × Deposit sensitivity matrix.
  */
 
-import { asciiCompare, clamp, roundTo } from "./model.ts";
+import { asciiCompare, roundTo } from "./model.ts";
 import type { ScoredCandidate } from "./model.ts";
 
-export type ViabilityTier = "VIABLE" | "WHALE_ONLY" | "NEGATIVE";
+export type FarmVerdict = "FARM" | "MARGINAL" | "SKIP";
 
 export interface FarmStep {
   step: number;
+  when: string;
   title: string;
   action: string;
   gas_multiplier: number;
   gas_cost_usd: number;
   fee_cost_usd: number;
-  opp_cost_usd: number;
-  step_total_usd: number;
-  active_minutes: number;
-  holding_days: number;
+  tbill_cost_usd: number;
+  cost_usd: number;
+  minutes: number;
+}
+
+export interface SensitivityCell {
+  drop_share: number;
+  deposit_usd: number;
+  net_usd: number;
+  net_per_hour: number;
+  verdict: FarmVerdict;
 }
 
 export interface FarmEconomics {
-  capital_usd: number;
-  gross_ev_usd: number;
+  deposit_usd: number;
+  drop_share: number;
+  horizon_weeks: number;
+  horizon_days: number;
+  expected_drop_usd: number;
   gas_total_usd: number;
   fee_total_usd: number;
-  opp_cost_usd: number;
+  tbill_benchmark_usd: number;
   total_cost_usd: number;
-  net_ev_usd: number;
-  net_ev_low_usd: number;
-  net_ev_high_usd: number;
-  net_roi_pct: number;
-  break_even_capital_usd: number | null;
-  viability_tier: ViabilityTier;
+  net_usd: number;
+  net_p25_usd: number;
+  net_p75_usd: number;
+  hands_on_minutes: number;
+  hands_on_hours: number;
+  net_per_hour: number;
+  break_even_deposit_usd: number | null;
+  verdict: FarmVerdict;
 }
 
 export interface FarmPlan {
   optimal_chain: string;
   chain_gas_unit_usd: number;
   category_fee_bps: number;
-  holding_days: number;
-  launch_prob: number;
-  total_active_minutes: number;
   economics: FarmEconomics;
+  sensitivity: SensitivityCell[];
   steps: FarmStep[];
   farm_steps: string[];
   risks: string[];
 }
 
 export const FARM_CONSTANTS = {
-  defaultCapitalUsd: 2_500,
-  airdropPoolShare: 0.05,
-  eligibleTvlShare: 0.7,
-  riskFreeAnnualRate: 0.045,
+  defaultDepositUsd: 10_000,
+  defaultDropShare: 0.07,
+  defaultHorizonWeeks: 12,
+  tbillAnnualRate: 0.04,
+  farmHourlyThresholdUsd: 25,
+  sensitivityDropShares: [0.03, 0.05, 0.07, 0.10] as const,
+  sensitivityDeposits: [2_500, 10_000, 25_000, 50_000] as const,
   defaultGasUnitUsd: 0.5,
   defaultCategoryFeeBps: 20,
   chainGasUsd: {
@@ -159,9 +174,7 @@ export function getChainGasUnit(chain: string): number {
 
 export function getCategoryFeeBps(category: string): number {
   const key = category.trim().toLowerCase();
-  if (key in FARM_CONSTANTS.categoryFeeBps) {
-    return FARM_CONSTANTS.categoryFeeBps[key]!;
-  }
+  if (key in FARM_CONSTANTS.categoryFeeBps) return FARM_CONSTANTS.categoryFeeBps[key]!;
   if (key.includes("dex") || key.includes("amm") || key.includes("swap")) return 55;
   if (key.includes("lend") || key.includes("yield") || key.includes("vault") || key.includes("curator")) return 10;
   if (key.includes("perp") || key.includes("deriv") || key.includes("option") || key.includes("basis")) return 15;
@@ -170,9 +183,6 @@ export function getCategoryFeeBps(category: string): number {
   return FARM_CONSTANTS.defaultCategoryFeeBps;
 }
 
-/**
- * Picks the lowest-gas chain from candidate.chains (tie-break ASCII ascending).
- */
 export function selectOptimalChain(candidate: ScoredCandidate): string {
   if (candidate.chains.length > 0) {
     const sorted = [...candidate.chains].sort(
@@ -183,292 +193,330 @@ export function selectOptimalChain(candidate: ScoredCandidate): string {
   return "Multi-Chain";
 }
 
-function deriveHoldingDays(ageDays: number | null): number {
-  const effectiveAge = ageDays ?? 365;
-  if (effectiveAge >= 365) return 60;
-  if (effectiveAge >= 180) return 90;
-  return 120;
+function coreActionText(category: string, name: string, chain: string): string {
+  const k = category.toLowerCase();
+  if (k.includes("lend") || k.includes("collateral")) {
+    return `Supply USDC/blue-chip collateral on ${name} (${chain}) under 40% LTV to accrue points safely`;
+  }
+  if (k.includes("dex") || k.includes("amm") || k.includes("liquidity")) {
+    return `Provide correlated stablecoin LP on ${name} (${chain}) to curb IL while logging fee volume`;
+  }
+  if (k.includes("perp") || k.includes("deriv") || k.includes("basis")) {
+    return `Deposit USDC margin and run delta-neutral volume cycles on ${name} (${chain})`;
+  }
+  if (k.includes("restak") || k.includes("stak")) {
+    return `Stake or restake base asset into ${name} (${chain}) and hold receipt token`;
+  }
+  if (k.includes("curator") || k.includes("allocator")) {
+    return `Deposit stablecoins into a curated ${name} vault on ${chain} and retain vault shares`;
+  }
+  if (k.includes("predict")) {
+    return `Fund account on ${name} (${chain}) and open hedged binary positions`;
+  }
+  if (k.includes("bridge") || k.includes("cross")) {
+    return `Execute periodic organic bridge transfers via ${name} using ${chain} as low-gas hub`;
+  }
+  return `Deposit stablecoins into ${name}'s primary vault on ${chain} and retain receipt shares`;
+}
+
+export function classifyVerdict(netUsd: number, netPerHour: number): FarmVerdict {
+  if (netUsd <= 0) return "SKIP";
+  return netPerHour >= FARM_CONSTANTS.farmHourlyThresholdUsd ? "FARM" : "MARGINAL";
 }
 
 /**
- * Conservative hump-shaped TGE probability weight in [0.25, 0.65],
- * peaking around 18 months (540 days) and tapering for very new or >4y protocols.
+ * Exact quadratic break-even deposit solving:
+ *   implied * drop_share * D / (tvl + D) - (feeRate + tbillRate) * D - gas = 0
  */
-function deriveLaunchProbability(ageDays: number | null): number {
-  const effectiveAge = ageDays ?? 365;
-  const years = effectiveAge / 365;
-  const distFromPeak = Math.abs(Math.log(Math.max(years, 0.15) / 1.5));
-  const raw = 0.65 * Math.exp(-0.45 * distFromPeak * distFromPeak);
-  return roundTo(clamp(raw, 0.25, 0.65), 3);
-}
-
-function coreActionText(category: string, protocolName: string, chain: string): string {
-  const key = category.toLowerCase();
-  if (key.includes("lend") || key.includes("collateral")) {
-    return `Supply blue-chip collateral on ${protocolName} (${chain}) below 40% LTV to accrue points safely`;
+export function computeBreakEvenDeposit(
+  impliedValueUsd: number,
+  tvlUsd: number,
+  dropShare: number,
+  gasTotalUsd: number,
+  feeRate: number,
+  tbillRate: number,
+): number | null {
+  const A = impliedValueUsd * dropShare;
+  const r = feeRate + tbillRate;
+  const T = Math.max(1, tvlUsd);
+  const G = Math.max(0, gasTotalUsd);
+  if (r <= 1e-12) {
+    if (A <= G) return null;
+    return roundTo((G * T) / (A - G), 2);
   }
-  if (key.includes("dex") || key.includes("amm") || key.includes("liquidity")) {
-    return `Provide correlated stablecoin LP on ${protocolName} (${chain}) to curb IL while logging fee volume`;
-  }
-  if (key.includes("perp") || key.includes("deriv") || key.includes("basis")) {
-    return `Deposit margin and run delta-neutral volume cycles on ${protocolName} (${chain})`;
-  }
-  if (key.includes("restak") || key.includes("stak")) {
-    return `Stake or restake base asset into ${protocolName} (${chain}) and hold receipt token`;
-  }
-  if (key.includes("curator") || key.includes("allocator")) {
-    return `Deposit stablecoins into a curated ${protocolName} vault on ${chain} and hold vault shares`;
-  }
-  if (key.includes("predict")) {
-    return `Fund account on ${protocolName} (${chain}) and open hedged binary market positions`;
-  }
-  if (key.includes("bridge") || key.includes("cross")) {
-    return `Execute periodic organic bridge transfers via ${protocolName} using ${chain} as low-gas hub`;
-  }
-  return `Deposit stablecoin or base collateral into ${protocolName}'s core vault on ${chain}`;
+  const b = r * T + G - A;
+  if (b >= 0) return null; // even at optimal D, yield cannot beat variable rate + gas
+  const disc = b * b - 4 * r * G * T;
+  if (disc < 0) return null;
+  const root = (-b - Math.sqrt(disc)) / (2 * r);
+  return root > 0 && Number.isFinite(root) ? roundTo(root, 2) : null;
 }
 
 export function computeFarmEconomics(
   candidate: ScoredCandidate,
-  capitalUsd: number,
+  depositUsd: number,
+  dropShare: number,
+  horizonWeeks: number,
   gasTotalUsd: number,
   categoryFeeBps: number,
-  holdingDays: number,
-  launchProb: number,
+  handsOnMinutes: number,
 ): FarmEconomics {
+  const horizonDays = horizonWeeks * 7;
   const feeRate = categoryFeeBps / 10_000;
-  const oppRate = FARM_CONSTANTS.riskFreeAnnualRate * (holdingDays / 365);
+  const tbillRate = FARM_CONSTANTS.tbillAnnualRate * (horizonDays / 365);
 
-  const feeTotalUsd = roundTo(capitalUsd * feeRate, 2);
-  const oppCostUsd = roundTo(capitalUsd * oppRate, 2);
-  const totalCostUsd = roundTo(gasTotalUsd + feeTotalUsd + oppCostUsd, 2);
+  const feeTotalUsd = roundTo(depositUsd * feeRate, 2);
+  const tbillBenchmarkUsd = roundTo(depositUsd * tbillRate, 2);
+  const totalCostUsd = roundTo(gasTotalUsd + feeTotalUsd + tbillBenchmarkUsd, 2);
 
-  const yieldScale =
-    (FARM_CONSTANTS.airdropPoolShare * launchProb) / FARM_CONSTANTS.eligibleTvlShare;
+  const share = depositUsd / (candidate.tvl_usd + depositUsd);
+  const expectedDropUsd = roundTo(candidate.implied_value_usd * dropShare * share, 2);
+  const p25DropUsd = roundTo(candidate.implied_p25_usd * dropShare * share, 2);
+  const p75DropUsd = roundTo(candidate.implied_p75_usd * dropShare * share, 2);
 
-  const grossRateBase =
-    candidate.tvl_usd > 0 ? (candidate.implied_value_usd / candidate.tvl_usd) * yieldScale : 0;
-  const grossRateLow =
-    candidate.tvl_usd > 0 ? (candidate.implied_low_usd / candidate.tvl_usd) * yieldScale : 0;
-  const grossRateHigh =
-    candidate.tvl_usd > 0 ? (candidate.implied_high_usd / candidate.tvl_usd) * yieldScale : 0;
+  const netUsd = roundTo(expectedDropUsd - totalCostUsd, 2);
+  const netP25Usd = roundTo(p25DropUsd - totalCostUsd, 2);
+  const netP75Usd = roundTo(p75DropUsd - totalCostUsd, 2);
 
-  const grossEvUsd = roundTo(capitalUsd * grossRateBase, 2);
-  const netEvUsd = roundTo(grossEvUsd - totalCostUsd, 2);
-  const netEvLowUsd = roundTo(capitalUsd * grossRateLow - totalCostUsd, 2);
-  const netEvHighUsd = roundTo(capitalUsd * grossRateHigh - totalCostUsd, 2);
-  const netRoiPct = capitalUsd > 0 ? roundTo((netEvUsd / capitalUsd) * 100, 2) : 0;
-
-  const netYieldPerDollar = grossRateBase - (feeRate + oppRate);
-  let breakEvenCapitalUsd: number | null = null;
-  let viabilityTier: ViabilityTier = "NEGATIVE";
-
-  if (netYieldPerDollar > 1e-6) {
-    breakEvenCapitalUsd = roundTo(gasTotalUsd / netYieldPerDollar, 2);
-    viabilityTier = netEvUsd > 0 ? "VIABLE" : "WHALE_ONLY";
-  }
+  const exactHours = handsOnMinutes / 60;
+  const handsOnHours = roundTo(exactHours, 2);
+  const netPerHour = exactHours > 0 ? roundTo(netUsd / exactHours, 2) : 0;
+  const verdict = classifyVerdict(netUsd, netPerHour);
+  const breakEvenDepositUsd = computeBreakEvenDeposit(
+    candidate.implied_value_usd,
+    candidate.tvl_usd,
+    dropShare,
+    gasTotalUsd,
+    feeRate,
+    tbillRate,
+  );
 
   return {
-    capital_usd: roundTo(capitalUsd, 2),
-    gross_ev_usd: grossEvUsd,
+    deposit_usd: roundTo(depositUsd, 2),
+    drop_share: dropShare,
+    horizon_weeks: horizonWeeks,
+    horizon_days: horizonDays,
+    expected_drop_usd: expectedDropUsd,
     gas_total_usd: roundTo(gasTotalUsd, 2),
     fee_total_usd: feeTotalUsd,
-    opp_cost_usd: oppCostUsd,
+    tbill_benchmark_usd: tbillBenchmarkUsd,
     total_cost_usd: totalCostUsd,
-    net_ev_usd: netEvUsd,
-    net_ev_low_usd: netEvLowUsd,
-    net_ev_high_usd: netEvHighUsd,
-    net_roi_pct: netRoiPct,
-    break_even_capital_usd: breakEvenCapitalUsd,
-    viability_tier: viabilityTier,
+    net_usd: netUsd,
+    net_p25_usd: netP25Usd,
+    net_p75_usd: netP75Usd,
+    hands_on_minutes: handsOnMinutes,
+    hands_on_hours: handsOnHours,
+    net_per_hour: netPerHour,
+    break_even_deposit_usd: breakEvenDepositUsd,
+    verdict,
   };
 }
 
 function formatStepString(s: FarmStep, chain: string): string {
-  const timeText =
-    s.holding_days > 0
-      ? `${s.active_minutes} min active / ${s.holding_days}d hold`
-      : `${s.active_minutes} min`;
   const parts: string[] = [];
   if (s.gas_cost_usd > 0) parts.push(`gas $${s.gas_cost_usd.toFixed(2)}`);
   if (s.fee_cost_usd > 0) parts.push(`fee $${s.fee_cost_usd.toFixed(2)}`);
-  if (s.opp_cost_usd > 0) parts.push(`opp $${s.opp_cost_usd.toFixed(2)}`);
+  if (s.tbill_cost_usd > 0) parts.push(`4% T-bill opp $${s.tbill_cost_usd.toFixed(2)}`);
   const breakdown = parts.length > 0 ? ` (${parts.join(" + ")})` : "";
-  let line = `Step ${s.step} [${chain}]: ${s.action}. Cost: $${s.step_total_usd.toFixed(2)}${breakdown}. Time: ${timeText}.`;
-  if (line.length > 240) {
-    line = `${line.slice(0, 236)}...`;
-  }
+  let line = `Step ${s.step} [${s.when} · ${chain}]: ${s.action}. Cost: $${s.cost_usd.toFixed(2)}${breakdown}. Time: ${s.minutes} min.`;
+  if (line.length > 240) line = `${line.slice(0, 236)}...`;
   return line;
 }
 
 export function buildFarmPlan(
   candidate: ScoredCandidate,
-  capitalUsd: number = FARM_CONSTANTS.defaultCapitalUsd,
+  depositUsd: number = FARM_CONSTANTS.defaultDepositUsd,
+  dropShare: number = FARM_CONSTANTS.defaultDropShare,
+  horizonWeeks: number = FARM_CONSTANTS.defaultHorizonWeeks,
 ): FarmPlan {
   const optimalChain = selectOptimalChain(candidate);
   const chainGasUnitUsd = getChainGasUnit(optimalChain);
   const categoryFeeBps = getCategoryFeeBps(candidate.category);
-  const holdingDays = deriveHoldingDays(candidate.age_days);
-  const launchProb = deriveLaunchProbability(candidate.age_days);
-  const maintenanceCycles = Math.max(1, Math.floor(holdingDays / 30));
+  const horizonDays = horizonWeeks * 7;
 
   const feeRate = categoryFeeBps / 10_000;
-  const halfFeeUsd = roundTo(capitalUsd * feeRate * 0.5, 2);
-  const fullFeeUsd = roundTo(capitalUsd * feeRate, 2);
-  const exitFeeUsd = roundTo(fullFeeUsd - halfFeeUsd, 2);
-  const oppCostUsd = roundTo(
-    capitalUsd * FARM_CONSTANTS.riskFreeAnnualRate * (holdingDays / 365),
+  const fullFeeUsd = roundTo(depositUsd * feeRate, 2);
+  const entryFeeUsd = roundTo(depositUsd * feeRate * 0.5, 2);
+  const exitFeeUsd = roundTo(fullFeeUsd - entryFeeUsd, 2);
+  const tbillBenchmarkUsd = roundTo(
+    depositUsd * FARM_CONSTANTS.tbillAnnualRate * (horizonDays / 365),
     2,
   );
+
+  const midWeekEnd = Math.max(2, Math.floor(horizonWeeks / 2));
+  const lateWeekStart = Math.min(horizonWeeks - 1, midWeekEnd + 1);
+  const cyclesPerPhase = Math.max(1, Math.round(horizonWeeks / 6));
 
   const stepSpecs = [
     {
       step: 1,
-      title: "Fund & Bridge to Optimal Chain",
-      action: `Prepare $${capitalUsd.toLocaleString("en-US")} and bridge funds onto ${optimalChain} (lowest-gas chain for ${candidate.name})`,
-      gasMultiplier: 1.5,
+      when: "Day 0",
+      title: "Isolate Wallet & Verify Contracts",
+      action: `Create clean farm wallet, verify official ${candidate.name} contracts on ${optimalChain}, and cap allocation`,
+      gasMultiplier: 0,
       feeCostUsd: 0,
-      oppCostUsd: 0,
-      activeMinutes: 10,
-      holdingDays: 0,
+      tbillCostUsd: 0,
+      minutes: 10,
     },
     {
       step: 2,
-      title: "Verify Contracts & Risk Caps",
-      action: `Verify official ${candidate.name} contracts on ${optimalChain}, check audit history, and cap exposure`,
-      gasMultiplier: 0,
+      when: "Day 0",
+      title: "Bridge Deposit to Optimal Chain",
+      action: `Bridge $${depositUsd.toLocaleString("en-US")} onto ${optimalChain} (lowest-gas supported chain for ${candidate.name})`,
+      gasMultiplier: 1.5,
       feeCostUsd: 0,
-      oppCostUsd: 0,
-      activeMinutes: 10,
-      holdingDays: 0,
+      tbillCostUsd: 0,
+      minutes: 10,
     },
     {
       step: 3,
-      title: "Convert Assets & Approve",
-      action: `Swap into required ${candidate.category} asset(s) on ${optimalChain} and submit exact-amount approval`,
+      when: "Day 0",
+      title: "Swap Assets & Exact Approval",
+      action: `Convert into required ${candidate.category} asset(s) on ${optimalChain} and sign exact-amount approval`,
       gasMultiplier: 1.0,
-      feeCostUsd: halfFeeUsd,
-      oppCostUsd: 0,
-      activeMinutes: 5,
-      holdingDays: 0,
+      feeCostUsd: entryFeeUsd,
+      tbillCostUsd: 0,
+      minutes: 8,
     },
     {
       step: 4,
-      title: "Execute Core Farming Position",
+      when: "Day 0",
+      title: "Deploy Core Farming Position",
       action: coreActionText(candidate.category, candidate.name, optimalChain),
       gasMultiplier: 2.0,
       feeCostUsd: 0,
-      oppCostUsd: 0,
-      activeMinutes: 10,
-      holdingDays: 0,
+      tbillCostUsd: 0,
+      minutes: 12,
     },
     {
       step: 5,
-      title: "Maintain Organic Cadence",
-      action: `Run ${maintenanceCycles} monthly maintenance tx(s) across ${holdingDays}d on ${optimalChain} to clear sybil checks`,
-      gasMultiplier: maintenanceCycles * 1.0,
+      when: `Weeks 2–${midWeekEnd}`,
+      title: "Early-Window Organic Cadence",
+      action: `Run ${cyclesPerPhase} lightweight activity tx(s) on ${optimalChain} to clear sybil cadence thresholds`,
+      gasMultiplier: cyclesPerPhase * 1.0,
       feeCostUsd: 0,
-      oppCostUsd: 0,
-      activeMinutes: maintenanceCycles * 5,
-      holdingDays,
+      tbillCostUsd: 0,
+      minutes: cyclesPerPhase * 8,
     },
     {
       step: 6,
-      title: "Claim & Realize TGE Allocation",
-      action: `Claim ${candidate.name} allocation at TGE on ${optimalChain} via official portal and convert to stablecoins`,
-      gasMultiplier: 2.5,
-      feeCostUsd: exitFeeUsd,
-      oppCostUsd: 0,
-      activeMinutes: 10,
-      holdingDays: 0,
+      when: `Weeks ${lateWeekStart}–${Math.max(lateWeekStart, horizonWeeks - 1)}`,
+      title: "Retention & Points Checkpoint",
+      action: `Verify snapshot eligibility and run ${cyclesPerPhase} retention tx(s) on ${optimalChain} without breaking streak`,
+      gasMultiplier: cyclesPerPhase * 1.0,
+      feeCostUsd: 0,
+      tbillCostUsd: 0,
+      minutes: cyclesPerPhase * 7,
     },
     {
       step: 7,
-      title: "Unwind Principal & Reconcile P&L",
-      action: `Withdraw principal from ${candidate.name} on ${optimalChain} and book ${holdingDays}d risk-free opportunity cost`,
+      when: `Week ${horizonWeeks} (TGE)`,
+      title: "Claim & Realize Token Allocation",
+      action: `Claim ${candidate.name} TGE allocation via official portal on ${optimalChain} and convert to stablecoins`,
+      gasMultiplier: 2.5,
+      feeCostUsd: exitFeeUsd,
+      tbillCostUsd: 0,
+      minutes: 15,
+    },
+    {
+      step: 8,
+      when: `Week ${horizonWeeks}`,
+      title: "Unwind Principal & Book T-Bill Cost",
+      action: `Withdraw principal from ${candidate.name} on ${optimalChain} and account for ${horizonDays}d 4.0% APR T-bill benchmark`,
       gasMultiplier: 1.5,
       feeCostUsd: 0,
-      oppCostUsd,
-      activeMinutes: 10,
-      holdingDays: 0,
+      tbillCostUsd: tbillBenchmarkUsd,
+      minutes: 10,
     },
   ];
 
   const steps: FarmStep[] = stepSpecs.map((s) => {
     const gasCostUsd = roundTo(chainGasUnitUsd * s.gasMultiplier, 2);
-    const stepTotalUsd = roundTo(gasCostUsd + s.feeCostUsd + s.oppCostUsd, 2);
+    const costUsd = roundTo(gasCostUsd + s.feeCostUsd + s.tbillCostUsd, 2);
     return {
       step: s.step,
+      when: s.when,
       title: s.title,
       action: s.action,
       gas_multiplier: s.gasMultiplier,
       gas_cost_usd: gasCostUsd,
       fee_cost_usd: s.feeCostUsd,
-      opp_cost_usd: s.oppCostUsd,
-      step_total_usd: stepTotalUsd,
-      active_minutes: s.activeMinutes,
-      holding_days: s.holdingDays,
+      tbill_cost_usd: s.tbillCostUsd,
+      cost_usd: costUsd,
+      minutes: s.minutes,
     };
   });
 
-  const gasTotalUsd = roundTo(
-    steps.reduce((acc, s) => acc + s.gas_cost_usd, 0),
-    2,
-  );
+  const gasTotalUsd = roundTo(steps.reduce((acc, s) => acc + s.gas_cost_usd, 0), 2);
+  const handsOnMinutes = steps.reduce((acc, s) => acc + s.minutes, 0);
   const economics = computeFarmEconomics(
     candidate,
-    capitalUsd,
+    depositUsd,
+    dropShare,
+    horizonWeeks,
     gasTotalUsd,
     categoryFeeBps,
-    holdingDays,
-    launchProb,
+    handsOnMinutes,
   );
 
   // Strict penny reconciliation check
-  const sumSteps = roundTo(
-    steps.reduce((acc, s) => acc + s.step_total_usd, 0),
-    2,
-  );
+  const sumSteps = roundTo(steps.reduce((acc, s) => acc + s.cost_usd, 0), 2);
   if (Math.abs(sumSteps - economics.total_cost_usd) >= 0.01) {
     throw new Error(
-      `Farm cost reconciliation mismatch for ${candidate.slug}: steps=${sumSteps}, total=${economics.total_cost_usd}`,
+      `Farm step reconciliation mismatch for ${candidate.slug}: sum=${sumSteps}, total=${economics.total_cost_usd}`,
     );
+  }
+
+  // 4×4 Sensitivity Matrix (drop_share × deposit_usd)
+  const sensitivity: SensitivityCell[] = [];
+  for (const ds of FARM_CONSTANTS.sensitivityDropShares) {
+    for (const dep of FARM_CONSTANTS.sensitivityDeposits) {
+      const econ = computeFarmEconomics(
+        candidate,
+        dep,
+        ds,
+        horizonWeeks,
+        gasTotalUsd,
+        categoryFeeBps,
+        handsOnMinutes,
+      );
+      sensitivity.push({
+        drop_share: ds,
+        deposit_usd: dep,
+        net_usd: econ.net_usd,
+        net_per_hour: econ.net_per_hour,
+        verdict: econ.verdict,
+      });
+    }
   }
 
   const farm_steps = steps.map((s) => formatStepString(s, optimalChain));
 
   const risks: string[] = [
-    `DefiLlama records no token for ${candidate.name}; no guarantee it will launch a token or reward retroactive users (launch weight ${(launchProb * 100).toFixed(0)}%).`,
-    `Smart-contract, liquidity, and depeg risk on ${optimalChain} throughout the ${holdingDays}-day holding window.`,
+    `DefiLlama records no token for ${candidate.name}; Model B estimates ${(candidate.token_odds * 100).toFixed(1)}% token odds — no launch is guaranteed.`,
+    `Smart-contract, liquidity, and depeg exposure on ${optimalChain} over the ${horizonWeeks}-week (${horizonDays}d) horizon.`,
   ];
-  if (candidate.category_fallback) {
+  if (candidate.breakdown.category_peer_count < 3) {
     risks.push(
-      `Category "${candidate.category}" has fewer than 3 live peers (${candidate.category_peer_count}); valuation uses shrunk global fallback.`,
+      `Category "${candidate.category}" has ${candidate.breakdown.category_peer_count} traded comp(s); category effect shrinks toward global power-law.`,
     );
   }
-  if (economics.viability_tier === "NEGATIVE") {
+  if (economics.verdict === "SKIP") {
     risks.push(
-      `Structurally net-negative under base assumptions: fee + opportunity cost exceed expected pro-rata airdrop yield.`,
+      `Net-negative at $${depositUsd.toLocaleString("en-US")} (${economics.net_usd < 0 ? `-$${Math.abs(economics.net_usd).toFixed(2)}` : "$0.00"}) after ${categoryFeeBps} bps fees and 4.0% T-bill benchmark.`,
     );
-  } else if (
-    economics.viability_tier === "WHALE_ONLY" &&
-    economics.break_even_capital_usd !== null
-  ) {
+  } else if (economics.verdict === "MARGINAL") {
     risks.push(
-      `Gas-negative at $${capitalUsd.toLocaleString("en-US")}; requires at least $${economics.break_even_capital_usd.toLocaleString("en-US")} to break even.`,
+      `Positive Net EV (+$${economics.net_usd.toFixed(2)}) but $${economics.net_per_hour.toFixed(2)}/hr falls below the $25/hr FARM hurdle.`,
     );
   }
-
-  const totalActiveMinutes = steps.reduce((acc, s) => acc + s.active_minutes, 0);
 
   return {
     optimal_chain: optimalChain,
     chain_gas_unit_usd: chainGasUnitUsd,
     category_fee_bps: categoryFeeBps,
-    holding_days: holdingDays,
-    launch_prob: launchProb,
-    total_active_minutes: totalActiveMinutes,
     economics,
+    sensitivity,
     steps,
     farm_steps,
     risks,

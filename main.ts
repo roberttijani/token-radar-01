@@ -154,7 +154,12 @@ function main(): void {
   const modelOut = runValuationModel(snapshot);
 
   const rows: BoardRow[] = modelOut.candidates.map((candidate) => {
-    const farm_plan = buildFarmPlan(candidate, FARM_CONSTANTS.defaultCapitalUsd);
+    const farm_plan = buildFarmPlan(
+      candidate,
+      FARM_CONSTANTS.defaultDepositUsd,
+      FARM_CONSTANTS.defaultDropShare,
+      FARM_CONSTANTS.defaultHorizonWeeks,
+    );
     return {
       ...candidate,
       farm_steps: farm_plan.farm_steps,
@@ -208,11 +213,13 @@ function main(): void {
   }
 
   const cal = modelOut.calibration;
-  const viableCount = rows.filter((r) => r.farm_plan.economics.viability_tier === "VIABLE").length;
+  const farmCount = rows.filter((r) => r.farm_plan.economics.verdict === "FARM").length;
+  const margCount = rows.filter((r) => r.farm_plan.economics.verdict === "MARGINAL").length;
+  const skipCount = rows.filter((r) => r.farm_plan.economics.verdict === "SKIP").length;
   process.stdout.write(
-    `token-radar: as_of=${snapshot.as_of} | candidates=${rows.length} (watchlist=${cal.watchlist_count}/${snapshot.watchlist.length}, early=${cal.early_find_count}) | live_comps=${cal.training_count} | viable@$2.5k=${viableCount}\n` +
-      `token-radar: LOOCV MdAPE global=${cal.audit.global_baseline.mdape}% cat=${cal.audit.category_only.mdape}% calibrated=${cal.audit.calibrated_model.mdape}% (rho=${cal.audit.calibrated_model.spearman_rho}, within2x=${cal.audit.calibrated_model.within_2x_pct}%)\n` +
-      `token-radar: wrote board.json, data.js, dashboard/ (${dashFiles.length} files), screenshots/ (${shotFiles.length} files)${skipDossier ? " [dossier skipped]" : ", dossier.json"}\n`,
+    `token-radar v2: as_of=${snapshot.as_of} | accounted=${cal.accounting.total}/${snapshot.protocols.length} | ranked=${rows.length} (wl=${cal.accounting.ranked_watchlist}/${snapshot.watchlist.length}, early=${cal.accounting.ranked_early_or_offlist}) | traded=${cal.accounting.traded_anchors}\n` +
+      `token-radar v2: value_miss LOO=x${cal.value_model.final_loo_typical_miss} (flat x${cal.value_model.flat_multiple_loo_miss}) WF=x${cal.value_model.final_wf_typical_miss} (flat x${cal.value_model.flat_multiple_wf_miss}) rho=${cal.value_model.final_loo_spearman_rho} | odds_brier LOO=${cal.odds_model.final_brier_loo} (base ${cal.odds_model.base_brier_loo})\n` +
+      `token-radar v2: verdicts @$10k/7%/12w: FARM=${farmCount} MARGINAL=${margCount} SKIP=${skipCount} | wrote board.json, data.js, dashboard/ (${dashFiles.length}), screenshots/ (${shotFiles.length})${skipDossier ? " [dossier skipped]" : ", dossier.json"}\n`,
   );
 }
 
