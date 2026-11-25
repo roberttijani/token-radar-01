@@ -1,0 +1,18 @@
+# Official bounty kit & local build artifacts
+token-radar-01-kit/
+token-radar-01-kit.tar.gz
+out/
+out1/
+out2/
+
+# Transcripts, keys, and local temp files
+transcripts.tar.gz
+*.tar.gz
+wallet.json
+*.keypair.json
+.env
+.env.*
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
